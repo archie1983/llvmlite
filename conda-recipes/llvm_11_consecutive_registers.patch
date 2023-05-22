@@ -1,75 +1,28 @@
-commit 8e0d52e9e3a983ab441ca59978b58d688732dcf2
-Author: David Spickett <david.spickett@linaro.org>
-Date:   Wed Jun 9 16:36:39 2021 +0000
+From d29d46ff077f083fdcf9759f787f94351437445b Mon Sep 17 00:00:00 2001
+From: Arturs Elksnis <archie1983@hotmail.co.uk>
+Date: Mon, 22 May 2023 12:17:37 +0000
+Subject: [PATCH] Last patch applied:
+ ../llvmlite/conda-recipes/llvm_11_consecutive_registers.patch
 
-    [llvm][AArch64] Handle arrays of struct properly (from IR)
-    
-    This only applies to FastIsel. GlobalIsel seems to sidestep
-    the issue.
-    
-    This fixes https://bugs.llvm.org/show_bug.cgi?id=46996
-    
-    One of the things we do in llvm is decide if a type needs
-    consecutive registers. Previously, we just checked if it
-    was an array or not.
-    (plus an SVE specific check that is not changing here)
-    
-    This causes some confusion when you arbitrary IR like:
-    ```
-    %T1 = type { double, i1 };
-    define [ 1 x %T1 ] @foo() {
-    entry:
-      ret [ 1 x %T1 ] zeroinitializer
-    }
-    ```
-    
-    We see it is an array so we call CC_AArch64_Custom_Block
-    which bails out when it sees the i1, a type we don't want
-    to put into a block.
-    
-    This leaves the location of the double in some kind of
-    intermediate state and leads to odd codegen. Which then crashes
-    the backend because it doesn't know how to implement
-    what it's been asked for.
-    
-    You get this:
-    ```
-      renamable $d0 = FMOVD0
-      $w0 = COPY killed renamable $d0
-    ```
-    
-    Rather than this:
-    ```
-      $d0 = FMOVD0
-      $w0 = COPY $wzr
-    ```
-    
-    The backend knows how to copy 64 bit to 64 bit registers,
-    but not 64 to 32. It can certainly be taught how but the real
-    issue seems to be us even trying to assign a register block
-    in the first place.
-    
-    This change makes the logic of
-    AArch64TargetLowering::functionArgumentNeedsConsecutiveRegisters
-    a bit more in depth. If we find an array, also check that all the
-    nested aggregates in that array have a single member type.
-    
-    Then CC_AArch64_Custom_Block's assumption of a type that looks
-    like [ N x type ] will be valid and we get the expected codegen.
-    
-    New tests have been added to exercise these situations. Note that
-    some of the output is not ABI compliant. The aim of this change is
-    to simply handle these situations and not to make our processing
-    of arbitrary IR ABI compliant.
-    
-    Reviewed By: efriedma
-    
-    Differential Revision: https://reviews.llvm.org/D104123
+---
+ include/llvm/CodeGen/TargetLowering.h         |   3 +-
+ lib/CodeGen/SelectionDAG/FastISel.cpp         |   2 +-
+ .../SelectionDAG/SelectionDAGBuilder.cpp      |   8 +-
+ lib/Target/AArch64/AArch64ISelLowering.cpp    |  19 +-
+ lib/Target/AArch64/AArch64ISelLowering.h      |   7 +-
+ .../AArch64/GISel/AArch64CallLowering.cpp     |   2 +-
+ lib/Target/ARM/ARMCallLowering.cpp            |   2 +-
+ lib/Target/ARM/ARMISelLowering.cpp            |   3 +-
+ lib/Target/ARM/ARMISelLowering.h              |   3 +-
+ lib/Target/PowerPC/PPCISelLowering.h          |   3 +-
+ .../argument-blocks-array-of-struct.ll        | 511 ++++++++++++++++++
+ 11 files changed, 541 insertions(+), 22 deletions(-)
+ create mode 100644 test/CodeGen/AArch64/argument-blocks-array-of-struct.ll
 
-diff --git a/llvm/include/llvm/CodeGen/TargetLowering.h b/llvm/include/llvm/CodeGen/TargetLowering.h
-index 06f2b3ca38ea..f6b8ab1a8aef 100644
---- a/llvm/include/llvm/CodeGen/TargetLowering.h
-+++ b/llvm/include/llvm/CodeGen/TargetLowering.h
+diff --git a/include/llvm/CodeGen/TargetLowering.h b/include/llvm/CodeGen/TargetLowering.h
+index 06f2b3ca..f6b8ab1a 100644
+--- a/include/llvm/CodeGen/TargetLowering.h
++++ b/include/llvm/CodeGen/TargetLowering.h
 @@ -3954,7 +3954,8 @@ public:
    /// must be passed in a block of consecutive registers.
    virtual bool
@@ -80,10 +33,10 @@ index 06f2b3ca38ea..f6b8ab1a8aef 100644
      return false;
    }
  
-diff --git a/llvm/lib/CodeGen/SelectionDAG/FastISel.cpp b/llvm/lib/CodeGen/SelectionDAG/FastISel.cpp
-index f5948d2a20dc..88053aaf6584 100644
---- a/llvm/lib/CodeGen/SelectionDAG/FastISel.cpp
-+++ b/llvm/lib/CodeGen/SelectionDAG/FastISel.cpp
+diff --git a/lib/CodeGen/SelectionDAG/FastISel.cpp b/lib/CodeGen/SelectionDAG/FastISel.cpp
+index f5948d2a..88053aaf 100644
+--- a/lib/CodeGen/SelectionDAG/FastISel.cpp
++++ b/lib/CodeGen/SelectionDAG/FastISel.cpp
 @@ -1192,7 +1192,7 @@ bool FastISel::lowerCallTo(CallLoweringInfo &CLI) {
      if (Arg.IsByVal)
        FinalType = cast<PointerType>(Arg.Ty)->getElementType();
@@ -93,10 +46,10 @@ index f5948d2a20dc..88053aaf6584 100644
  
      ISD::ArgFlagsTy Flags;
      if (Arg.IsZExt)
-diff --git a/llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp b/llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
-index d2930391f87a..e3d8e43b54d8 100644
---- a/llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
-+++ b/llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
+diff --git a/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp b/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
+index d2930391..e3d8e43b 100644
+--- a/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
++++ b/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp
 @@ -1862,7 +1862,7 @@ void SelectionDAGBuilder::visitRet(const ReturnInst &I) {
  
        bool NeedsRegBlock = TLI.functionArgumentNeedsConsecutiveRegisters(
@@ -133,10 +86,10 @@ index d2930391f87a..e3d8e43b54d8 100644
      for (unsigned Value = 0, NumValues = ValueVTs.size();
           Value != NumValues; ++Value) {
        EVT VT = ValueVTs[Value];
-diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
-index 48ca9039b1bd..6070ef1de44f 100644
---- a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
-+++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+diff --git a/lib/Target/AArch64/AArch64ISelLowering.cpp b/lib/Target/AArch64/AArch64ISelLowering.cpp
+index 48ca9039..6070ef1d 100644
+--- a/lib/Target/AArch64/AArch64ISelLowering.cpp
++++ b/lib/Target/AArch64/AArch64ISelLowering.cpp
 @@ -31,6 +31,7 @@
  #include "llvm/ADT/Triple.h"
  #include "llvm/ADT/Twine.h"
@@ -171,10 +124,10 @@ index 48ca9039b1bd..6070ef1de44f 100644
  }
  
  bool AArch64TargetLowering::shouldNormalizeToSelectSequence(LLVMContext &,
-diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.h b/llvm/lib/Target/AArch64/AArch64ISelLowering.h
-index 4fe77481706b..425ba055926a 100644
---- a/llvm/lib/Target/AArch64/AArch64ISelLowering.h
-+++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.h
+diff --git a/lib/Target/AArch64/AArch64ISelLowering.h b/lib/Target/AArch64/AArch64ISelLowering.h
+index 4fe77481..425ba055 100644
+--- a/lib/Target/AArch64/AArch64ISelLowering.h
++++ b/lib/Target/AArch64/AArch64ISelLowering.h
 @@ -727,9 +727,10 @@ public:
    MachineMemOperand::Flags getTargetMMOFlags(
      const Instruction &I) const override;
@@ -189,10 +142,10 @@ index 4fe77481706b..425ba055926a 100644
    /// Used for exception handling on Win64.
    bool needsFixedCatchObjects() const override;
  
-diff --git a/llvm/lib/Target/AArch64/GISel/AArch64CallLowering.cpp b/llvm/lib/Target/AArch64/GISel/AArch64CallLowering.cpp
-index 4832ae8f415f..0daa930c3b26 100644
---- a/llvm/lib/Target/AArch64/GISel/AArch64CallLowering.cpp
-+++ b/llvm/lib/Target/AArch64/GISel/AArch64CallLowering.cpp
+diff --git a/lib/Target/AArch64/GISel/AArch64CallLowering.cpp b/lib/Target/AArch64/GISel/AArch64CallLowering.cpp
+index 4832ae8f..0daa930c 100644
+--- a/lib/Target/AArch64/GISel/AArch64CallLowering.cpp
++++ b/lib/Target/AArch64/GISel/AArch64CallLowering.cpp
 @@ -261,7 +261,7 @@ void AArch64CallLowering::splitToValueTypes(
    assert(OrigArg.Regs.size() == SplitVTs.size() && "Regs / types mismatch");
  
@@ -202,10 +155,10 @@ index 4832ae8f415f..0daa930c3b26 100644
    for (unsigned i = 0, e = SplitVTs.size(); i < e; ++i) {
      Type *SplitTy = SplitVTs[i].getTypeForEVT(Ctx);
      SplitArgs.emplace_back(OrigArg.Regs[i], SplitTy, OrigArg.Flags[0],
-diff --git a/llvm/lib/Target/ARM/ARMCallLowering.cpp b/llvm/lib/Target/ARM/ARMCallLowering.cpp
-index d860473011e7..c0f8b50cdc51 100644
---- a/llvm/lib/Target/ARM/ARMCallLowering.cpp
-+++ b/llvm/lib/Target/ARM/ARMCallLowering.cpp
+diff --git a/lib/Target/ARM/ARMCallLowering.cpp b/lib/Target/ARM/ARMCallLowering.cpp
+index d8604730..c0f8b50c 100644
+--- a/lib/Target/ARM/ARMCallLowering.cpp
++++ b/lib/Target/ARM/ARMCallLowering.cpp
 @@ -219,7 +219,7 @@ void ARMCallLowering::splitToValueTypes(const ArgInfo &OrigArg,
  
      bool NeedsConsecutiveRegisters =
@@ -215,10 +168,10 @@ index d860473011e7..c0f8b50cdc51 100644
      if (NeedsConsecutiveRegisters) {
        Flags.setInConsecutiveRegs();
        if (i == e - 1)
-diff --git a/llvm/lib/Target/ARM/ARMISelLowering.cpp b/llvm/lib/Target/ARM/ARMISelLowering.cpp
-index 287e2e60e572..ac09439cc878 100644
---- a/llvm/lib/Target/ARM/ARMISelLowering.cpp
-+++ b/llvm/lib/Target/ARM/ARMISelLowering.cpp
+diff --git a/lib/Target/ARM/ARMISelLowering.cpp b/lib/Target/ARM/ARMISelLowering.cpp
+index 287e2e60..ac09439c 100644
+--- a/lib/Target/ARM/ARMISelLowering.cpp
++++ b/lib/Target/ARM/ARMISelLowering.cpp
 @@ -18852,7 +18852,8 @@ Align ARMTargetLowering::getABIAlignmentForCallingConv(Type *ArgTy,
  /// [N x i32] or [N x i64]. This allows front-ends to skip emitting padding when
  /// passing according to AAPCS rules.
@@ -229,10 +182,10 @@ index 287e2e60e572..ac09439cc878 100644
    if (getEffectiveCallingConv(CallConv, isVarArg) !=
        CallingConv::ARM_AAPCS_VFP)
      return false;
-diff --git a/llvm/lib/Target/ARM/ARMISelLowering.h b/llvm/lib/Target/ARM/ARMISelLowering.h
-index 8b1f4183032e..f05a42db9c75 100644
---- a/llvm/lib/Target/ARM/ARMISelLowering.h
-+++ b/llvm/lib/Target/ARM/ARMISelLowering.h
+diff --git a/lib/Target/ARM/ARMISelLowering.h b/lib/Target/ARM/ARMISelLowering.h
+index 8b1f4183..f05a42db 100644
+--- a/lib/Target/ARM/ARMISelLowering.h
++++ b/lib/Target/ARM/ARMISelLowering.h
 @@ -570,7 +570,8 @@ class VectorType;
      /// Returns true if an argument of type Ty needs to be passed in a
      /// contiguous block of registers in calling convention CallConv.
@@ -243,10 +196,10 @@ index 8b1f4183032e..f05a42db9c75 100644
  
      /// If a physical register, this returns the register that receives the
      /// exception address on entry to an EH pad.
-diff --git a/llvm/lib/Target/PowerPC/PPCISelLowering.h b/llvm/lib/Target/PowerPC/PPCISelLowering.h
-index 768eaa43e013..a3e53430c5b3 100644
---- a/llvm/lib/Target/PowerPC/PPCISelLowering.h
-+++ b/llvm/lib/Target/PowerPC/PPCISelLowering.h
+diff --git a/lib/Target/PowerPC/PPCISelLowering.h b/lib/Target/PowerPC/PPCISelLowering.h
+index 768eaa43..a3e53430 100644
+--- a/lib/Target/PowerPC/PPCISelLowering.h
++++ b/lib/Target/PowerPC/PPCISelLowering.h
 @@ -959,7 +959,8 @@ namespace llvm {
      /// Returns true if an argument of type Ty needs to be passed in a
      /// contiguous block of registers in calling convention CallConv.
@@ -257,11 +210,11 @@ index 768eaa43e013..a3e53430c5b3 100644
        // We support any array type as "consecutive" block in the parameter
        // save area.  The element type defines the alignment requirement and
        // whether the argument should go in GPRs, FPRs, or VRs if available.
-diff --git a/llvm/test/CodeGen/AArch64/argument-blocks-array-of-struct.ll b/llvm/test/CodeGen/AArch64/argument-blocks-array-of-struct.ll
+diff --git a/test/CodeGen/AArch64/argument-blocks-array-of-struct.ll b/test/CodeGen/AArch64/argument-blocks-array-of-struct.ll
 new file mode 100644
-index 000000000000..47ebc394d739
+index 00000000..47ebc394
 --- /dev/null
-+++ b/llvm/test/CodeGen/AArch64/argument-blocks-array-of-struct.ll
++++ b/test/CodeGen/AArch64/argument-blocks-array-of-struct.ll
 @@ -0,0 +1,511 @@
 +; RUN: llc -mtriple=aarch64-none-linux-gnu -o - %s | FileCheck %s
 +
@@ -774,3 +727,6 @@ index 000000000000..47ebc394d739
 +  call void @callee_no_block(%T_NO_BLOCK %1)
 +  ret void
 +}
+-- 
+2.25.1
+
